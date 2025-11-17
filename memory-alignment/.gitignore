@@ -1,0 +1,11 @@
+# Build directory
+build/
+
+# Compiled binaries
+*.o
+*.out
+*.exe
+
+# Assembly files
+*.s
+*.asm
