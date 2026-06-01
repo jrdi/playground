@@ -1,0 +1,7 @@
+[project]
+name = "lazyfs"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "fusepy>=3.0.1",
+]
