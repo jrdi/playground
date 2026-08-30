@@ -72,9 +72,7 @@ class ContentStore:
         rejects anything else -- and it is what makes the store algorithm-agile:
         the digest says how to check itself.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.1: ContentStore.digest_bytes -- implement me (see the docstring above)"
-        )
+        return f"{ALGO}:{hashlib.sha256(data).hexdigest()}"
 
     @staticmethod
     def digest_file(path: Path) -> Digest:
@@ -85,9 +83,12 @@ class ContentStore:
         multipart path in 1.9 hashes the file this way and then expects the small
         path's digests to interoperate.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.2: ContentStore.digest_file -- implement me (see the docstring above)"
-        )
+        hash = hashlib.sha256()
+        with open(path, 'rb') as f:
+          while chunk := f.read(CHUNK):
+            hash.update(chunk)
+
+        return f"{ALGO}:{hash.hexdigest()}"
 
     def key_for(self, digest: Digest) -> str:
         """Map a digest to its S3 key.
@@ -111,9 +112,11 @@ class ContentStore:
         object. Cheap check, and the alternative is a corruption bug with no
         stack trace.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.3: ContentStore.key_for -- implement me (see the docstring above)"
-        )
+        algo, hash = digest.split(":")
+        if algo != ALGO or len(hash) != 64:
+          raise ValueError(f"{digest} not valid.")
+
+        return f"{self.prefix}/{algo}/{hash[:2]}/{hash[2:4]}/{hash}"
 
     # ---------------------------------------------------------------- reading
 
@@ -131,9 +134,16 @@ class ContentStore:
 
         Count the round-trip in ``self.stats["head"]``; the tests read it.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.4: ContentStore.exists -- implement me (see the docstring above)"
-        )
+        self.stats["head"] += 1
+
+        try:
+          self.s3.head_object(Bucket=self.bucket, Key=self.key_for(digest))
+        except ClientError as exc:
+          if s3mod.is_not_found(exc):
+            return False
+          raise
+
+        return True
 
     def missing(self, digests: Iterable[Digest], workers: int = 16) -> set[Digest]:
         """Return the subset of ``digests`` not already in the store.
@@ -141,9 +151,11 @@ class ContentStore:
         Issued concurrently: a push may reference hundreds of packs and a
         serial round-trip per digest would dominate push latency.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.5: ContentStore.missing -- implement me (see the docstring above)"
-        )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+          exist = pool.map(self.exists, digests)
+
+        return {digest for e, digest in zip(exist, digests) if not e}
+
 
     def get(self, digest: Digest, verify: bool = True) -> bytes:
         """Fetch an object's bytes.
@@ -162,9 +174,22 @@ class ContentStore:
 
         Count the round-trip in ``self.stats["get"]``.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.6: ContentStore.get -- implement me (see the docstring above)"
-        )
+        self.stats['get'] += 1
+
+        try:
+          response = self.s3.get_object(Bucket=self.bucket, Key=self.key_for(digest))
+        except ClientError as exc:
+          if s3mod.is_not_found(exc):
+            raise ObjectNotFound(f"Object {self.key_for(digest)} not found.") from exc
+          raise
+
+        bytes = response['Body'].read()
+        if verify:
+          upstream_digest = ContentStore.digest_bytes(bytes)
+          if digest != upstream_digest:
+            raise CorruptObject(f"Object {self.key_for(digest)} corrupted. {digest} != {upstream_digest}")
+
+        return bytes
 
     def download(self, digest: Digest, dest: Path) -> Path:
         """Stream an object to ``dest``, verifying the hash as bytes arrive.
@@ -182,9 +207,29 @@ class ContentStore:
 
         Create ``dest``'s parent if needed, and return ``dest``.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.7: ContentStore.download -- implement me (see the docstring above)"
-        )
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        upstream_digest = hashlib.sha256()
+
+        try:
+          response = self.s3.get_object(Bucket=self.bucket, Key=self.key_for(digest))
+        except ClientError as exc:
+          if s3mod.is_not_found(exc):
+            raise ObjectNotFound(f"Object {self.key_for(digest)} not found.") from exc
+          raise
+
+        with tmp.open('wb') as f:
+          for chunk in response['Body'].iter_chunks(CHUNK):
+            upstream_digest.update(chunk)
+            f.write(chunk)
+
+        if digest != f"{ALGO}:{upstream_digest.hexdigest()}":
+          tmp.unlink(missing_ok=True)
+          raise CorruptObject(f"Object {self.key_for(digest)} corrupted. {digest} != {upstream_digest}")
+
+        tmp.replace(dest)
+        return dest
 
     # ---------------------------------------------------------------- writing
 
@@ -197,9 +242,23 @@ class ContentStore:
         purely an optimization -- overwriting would be harmless -- but it saves a
         round-trip's worth of bandwidth and makes dedup observable.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.8: ContentStore.put -- implement me (see the docstring above)"
-        )
+        digest = ContentStore.digest_bytes(data)
+
+        try:
+          self.s3.put_object(
+            Bucket=self.bucket,
+            Key=self.key_for(digest),
+            Body=data,
+            IfNoneMatch='*'
+          )
+          self.stats["put"] += 1
+        except ClientError as exc:
+          if s3mod.is_precondition_failed(exc):
+            self.stats["put_deduped"] += 1
+          else:
+            raise
+
+        return digest
 
     def put_file(self, path: Path) -> Digest:
         """Store a file's contents, returning its digest.
@@ -208,9 +267,19 @@ class ContentStore:
         trick above does not apply to multipart, so we dedup with an explicit
         existence check instead.
         """
-        raise NotImplementedError(
-            "EXERCISE 1.9: ContentStore.put_file -- implement me (see the docstring above)"
-        )
+        size = path.stat().st_size
+        if size < MULTIPART_THRESHOLD:
+          return self.put(path.read_bytes())
+
+        digest = ContentStore.digest_file(path)
+        if self.exists(digest):
+          self.stats["put_deduped"] += 1
+          return digest
+
+        with path.open("rb") as f:
+          self.s3.upload_fileobj(f, self.bucket, self.key_for(digest))
+        self.stats["put_multipart"] += 1
+        return digest
 
     def put_many(self, blobs: Iterable[bytes], workers: int = 16) -> list[Digest]:
         blobs = list(blobs)
