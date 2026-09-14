@@ -308,9 +308,15 @@ class WalIndex:
         entries away. The two depend on each other: drop the snapshot from
         ``Base`` and ref history stops at the most recent compaction.
         """
-        raise NotImplementedError(
-            "EXERCISE 2.2: WalIndex.refs_at -- implement me (see the docstring above)"
-        )
+        refs = dict(self.base.refs) if self.base else {}
+
+        updates = []
+        for pointer in self.entries:
+            if pointer.seq > seq:
+                break
+            updates.extend(entries[pointer.entry_id].ref_updates)
+
+        return _apply_updates(refs, updates, validate=False)
 
     def find(self, entry_id: str) -> WalPointer | None:
         for pointer in self.entries:
@@ -332,9 +338,24 @@ class WalIndex:
         Idempotent on ``entry_id``: replaying an entry that already landed
         returns an equivalent index rather than duplicating the push.
         """
-        raise NotImplementedError(
-            "EXERCISE 2.3: WalIndex.apply_push -- implement me (see the docstring above)"
+        if self.find(entry.entry_id):
+            return self
+
+        new = self.copy()
+        _apply_updates(new.refs, entry.ref_updates, validate=True)
+
+        pointer = WalPointer(
+          seq=self.next_seq,
+          entry_id=entry.entry_id,
+          key=key,
+          pack=entry.pack,
+          pack_size=entry.pack_size,
         )
+        new.entries.append(pointer)
+        new.next_seq += 1
+        new.version += 1
+
+        return new
 
 
 def _apply_updates(
@@ -357,10 +378,18 @@ def _apply_updates(
     must compose, the second seeing the first. ``new is None`` deletes the
     ref. Returns the same dict it mutated.
     """
-    raise NotImplementedError(
-        "EXERCISE 2.1: _apply_updates -- implement me (see the docstring above)"
-    )
+    for update in updates:
+      if validate:
+        actual = refs.get(update.ref)
+        if actual != update.old:
+          raise RefConflict(update.ref, update.old, actual)
 
+      if update.new is None:
+        refs.pop(update.ref, None)
+      else:
+        refs[update.ref] = update.new
+
+    return refs
 
 class WalLog:
     """S3-backed WAL for one repository."""
@@ -417,9 +446,16 @@ class WalLog:
         ``test_append_persists_entry_then_publishes_it`` (the ETag you return must
         equal the one ``commit`` returned).
         """
-        raise NotImplementedError(
-            "EXERCISE 2.4: WalLog.load -- implement me (see the docstring above)"
-        )
+        self.stats["loads"] += 1
+
+        try:
+          res = self.s3.get_object(Bucket=self.bucket, Key=self.index_key)
+          return WalIndex.from_json(json.loads(res["Body"].read())), res["ETag"]
+        except ClientError as exc:
+          if s3mod.is_not_found(exc):
+            return WalIndex(self.repo_id), None
+
+          raise
 
     def load_if_changed(self, etag: str | None) -> tuple[WalIndex, str | None] | None:
         """Conditional GET: ``None`` if ``etag`` is still current, else ``(index, etag)``.
@@ -453,9 +489,20 @@ class WalLog:
 
         Test: ``test_load_if_changed_returns_none_when_current``.
         """
-        raise NotImplementedError(
-            "EXERCISE 2.5: WalLog.load_if_changed -- implement me (see the docstring above)"
-        )
+
+        if etag is None:
+          return self.load()
+
+        try:
+          res = self.s3.get_object(Bucket=self.bucket, Key=self.index_key, IfNoneMatch=etag)
+          return WalIndex.from_json(json.loads(res["Body"].read())), res["ETag"]
+        except ClientError as exc:
+          if s3mod.is_not_modified(exc):
+            return None
+          if s3mod.is_not_found(exc):
+            return WalIndex(self.repo_id), None
+
+          raise
 
     def read_entry(self, key: str) -> WalEntry:
         resp = self.s3.get_object(Bucket=self.bucket, Key=key)
@@ -550,9 +597,23 @@ class WalLog:
         path), ``test_commit_creating_an_index_twice_raises`` (the ``IfNoneMatch``
         path), ``test_append_retries_through_contention`` (the counter).
         """
-        raise NotImplementedError(
-            "EXERCISE 2.6: WalLog.commit -- implement me (see the docstring above)"
-        )
+        condition = {"IfMatch": etag} if etag is not None else {"IfNoneMatch": "*"}
+        try:
+          res = self.s3.put_object(
+            Bucket=self.bucket,
+            Key=self.index_key,
+            ContentType="application/json",
+            Body=json.dumps(index.to_json()),
+            **condition
+          )
+          self.stats["commits"] += 1
+          return res["ETag"]
+        except ClientError as exc:
+          if s3mod.is_precondition_failed(exc):
+            self.stats["cas_conflicts"] += 1
+            raise CasConflict(f"index for {self.repo_id} changed (etag={etag})") from exc
+
+          raise
 
     def append(
         self, entry: WalEntry, max_attempts: int = MAX_CAS_ATTEMPTS
@@ -574,6 +635,20 @@ class WalLog:
         Retries on ``CasConflict`` only. ``RefConflict`` propagates immediately:
         the client is stale and retrying cannot fix that.
         """
-        raise NotImplementedError(
-            "EXERCISE 2.7: WalLog.append -- implement me (see the docstring above)"
+        key = self.put_entry(entry)
+
+        for _ in range(max_attempts):
+          index, etag = self.load()
+          new_index = index.apply_push(entry, key)
+          try:
+            new_etag = self.commit(new_index, etag)
+          except CasConflict:
+            continue
+
+          pointer = new_index.find(entry.entry_id)
+          assert pointer is not None
+          return pointer, new_index, new_etag
+
+        raise CasConflict(
+          f"gave up appending to {self.repo_id} after {max_attempts} attempts"
         )
